@@ -1,0 +1,12 @@
+# What THIS repo delivers: the template CR + its task text (ConfigMap
+# wiki-lint-tasks, the static name the CR's taskTemplate references).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - template.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: wiki-lint-tasks
+    files:
+      - arch-sync.txt=tasks/arch-sync.txt

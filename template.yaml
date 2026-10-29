@@ -1,0 +1,41 @@
+# The wiki-lint WorkflowTemplate — this repo IS the template's home
+# (three-tier phase 3c, ADR-0011 amendment). spec.source (#787): the
+# MR-bridge proposes against THIS file; signed pushes land as revision
+# identity. The decision base: maxFixes is the template's own (per-env
+# divergence rides the field-wise instance merge); the task text rides
+# wiki-lint-tasks — THIS repo's ConfigMap.
+apiVersion: harmostes.dev/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: wiki-lint
+spec:
+  source:
+    forge: github
+    repo: tibrezus/harmostes-template-wiki-lint
+    path: template.yaml
+    branch: main
+    secretRef:
+      name: harmostes-template-webhook
+      key: secret
+  description: Documentation sync (C4/RIG → agent → wiki-lint → push)
+  prepare:
+    plugin:
+      name: rig-emit
+  agent:
+    skill: /skills/wiki/SKILL.md
+    tools:
+    - read
+    - bash
+    - edit
+    - grep
+    taskTemplate:
+      name: arch-sync
+      configMap: wiki-lint-tasks
+      key: arch-sync.txt
+    gate:
+      plugin:
+        name: wiki-lint
+    maxFixes: 3
+  deploy:
+    plugin:
+      name: git-push

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# harmostes builtin "rig-emit" prepare plugin (lc4 workflow).
+#
+# Clones the project source (HARMOSTES_SOURCE_URL/BRANCH), runs the universal
+# emit-rig.py to produce a RIG, places it into the workspace repo (the wiki) at
+# raw/arch/<project>/rig.json.
+#
+# DETERMINISTIC SKIP: the generated RIG is compared byte-for-byte with the
+# existing rig.json in the workspace repo. If identical, changed=false is
+# returned and the pipeline short-circuits BEFORE the agent runs — no LLM
+# tokens consumed. Only a genuinely different RIG triggers the agent.
+#
+# Mirrors what the llm-wiki controller's reconcile.sh does deterministically.
+# emit-rig.py + emit-rig.sh are vendored from the llm-wiki module
+# (.github/actions/repo-map/) — drift between the two is tracked.
+set -euo pipefail
+log() { echo "[rig-emit] $*"; }
+
+SRC_URL="${HARMOSTES_SOURCE_URL:?HARMOSTES_SOURCE_URL required}"
+# Credential hygiene (#347): SRC_URL gains a PAT / basic-auth pair below, so
+# capture the display form BEFORE any injection. The authed URL is used only
+# for the clone; the clone's stderr is scrubbed too (git echoes the URL on
+# failure), so no credential can reach plugin stdout → Workflow status.
+SRC_URL_DISPLAY="$SRC_URL"
+SRC_BRANCH="${HARMOSTES_SOURCE_BRANCH:-main}"
+SRC_LANG="${HARMOSTES_SOURCE_LANGUAGE:-}"
+PROJECT="${HARMOSTES_WORKFLOW:?HARMOSTES_WORKFLOW required}"
+WS_DIR="${HARMOSTES_WORKSPACE_DIR:-$HARMOSTES_WORKDIR}"
+EMITTER_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Embed the GitHub token into a github.com https URL for auth. The injected
+# token is a GitHub PAT (harmostes-github-token); injecting it into another host
+# (e.g. a public Forgejo mirror) yields a wrong-credential 401 — strictly worse
+# than anonymous. Non-GitHub https sources clone anonymously (or would need a
+# host-specific token, injected separately). No-op for SSH.
+if [ -n "${HARMOSTES_GIT_TOKEN:-}" ]; then
+  case "$SRC_URL" in
+    https://github.com/*) SRC_URL="https://x-access-token:${HARMOSTES_GIT_TOKEN}@${SRC_URL#https://}";;
+  esac
+fi
+
+# Forgejo (git.rezus.cloud) basic auth — separate credentials (username +
+# password) from harmostes-rzc-token. Private source mirrors use these.
+if [ -n "${HARMOSTES_RZC_USERNAME:-}" ] && [ -n "${HARMOSTES_RZC_PASSWORD:-}" ]; then
+  case "$SRC_URL" in
+    https://git.rezus.cloud/*) SRC_URL="https://${HARMOSTES_RZC_USERNAME}:${HARMOSTES_RZC_PASSWORD}@${SRC_URL#https://}";;
+  esac
+fi
+
+SRC_DIR="$(mktemp -d)/source"
+RIG_FILE="$(mktemp -d)/rig.json"
+mkdir -p "$WS_DIR/.source" 2>/dev/null || true
+log "cloning source $SRC_URL_DISPLAY ($SRC_BRANCH) into a temp dir (never inside the workspace repo)…"
+git clone --depth 100 --branch "$SRC_BRANCH" "$SRC_URL" "$SRC_DIR" 2>&1 | sed -E 's#(https?://)[^/@[:space:]]+@#\1REDACTED@#g' | tail -1 || {
+  echo '{"changed":false,"status":"failed","event":{"error":"clone failed"}}'
+  exit 1
+}
+
+log "generating RIG (language=${SRC_LANG:-auto})…"
+# Full emit log to a side file; WARN/ERROR lines surfaced on the plugin
+# log (tail -3 alone dropped the cycle warning whenever a completeness
+# warning travelled with it). The emit GATES: under `set -euo pipefail` a
+# command in an `if` condition is errexit-exempt, so the emit must run
+# BARE with an explicit rc capture — an `if (…)|tee|tail` wrapper turned
+# hard ERRORs into a green prepare (#346 r2 P4, mechanically verified).
+# NOTE: the emit prints to STDERR only; the plugin contract parses the
+# last JSON line of combined stdout+stderr — never print() to stdout in
+# emit-rig.py.
+EMIT_LOG="$RIG_FILE.emit.log"; rc=0
+( cd "$SRC_DIR" && bash "$EMITTER_DIR/emit-rig.sh" "$RIG_FILE" "$SRC_LANG" ) >"$EMIT_LOG" 2>&1 || rc=$?
+grep -E "^  (WARN|ERROR):|VALIDATION FAILED" "$EMIT_LOG" >&2 || true
+tail -3 "$EMIT_LOG" >&2
+if [ "$rc" -ne 0 ]; then
+  log "EMIT FAILED (rc=$rc) — full log: $EMIT_LOG (kept)"
+  echo '{"changed":false,"status":"failed","event":{"error":"rig emit failed"}}'
+  exit 1
+fi
+rm -f "$EMIT_LOG"
+
+COMPONENTS=$(python3 -c "import json;print(len(json.load(open('$RIG_FILE'))['components']))" 2>/dev/null || echo 0)
+log "RIG: $COMPONENTS components"
+
+# Canonical artifact: rig.db (queryable SQLite with symbols + FTS5).
+# rig.json stays alongside as a compat export.
+DEST_DIR="$WS_DIR/raw/arch/$PROJECT"
+mkdir -p "$DEST_DIR"
+MODEL_FILE="$DEST_DIR/model.c4"
+DB_FILE="${RIG_FILE%.json}.db"
+
+# Compute the canonical hash from the DB (page-layout-independent, volatile-
+# free) — stored in Workflow status by the pipeline. More reliable than the
+# workspace file because deploys may push to shadow branches.
+RIG_HASH=$(EMITTER="$EMITTER_DIR" python3 - "$DB_FILE" <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["EMITTER"])
+from rig.db import canonical_hash
+print(canonical_hash(sys.argv[1]))
+PYEOF
+) || RIG_HASH=$(sha256sum "$RIG_FILE" | cut -d' ' -f1)
+log "RIG hash=$RIG_HASH ($COMPONENTS components)"
+
+# Cross-run skip: if HARMOSTES_LAST_RIG_HASH is set (stamped from Workflow
+# status by the worker) and matches the freshly computed hash, skip even when
+# the workspace file differs (e.g. shadow branch lag). This prevents the agent
+# from re-running on a structurally unchanged source.
+if [ -n "${HARMOSTES_LAST_RIG_HASH:-}" ] && [ "$RIG_HASH" = "$HARMOSTES_LAST_RIG_HASH" ]; then
+  log "RIG hash unchanged ($RIG_HASH) — cross-run deterministic skip"
+  echo "{\"changed\":false,\"artifact\":\"raw/arch/$PROJECT/rig.db\",\"status\":\"ok\",\"event\":{\"components\":$COMPONENTS,\"rig_hash\":\"$RIG_HASH\"}}"
+  exit 0
+fi
+
+# Compare the DB (byte-deterministic) — NOT rig.json, which carries a
+# generated_at timestamp and would never match byte-for-byte.
+DEST_FILE="$DEST_DIR/rig.json"
+if [ -f "$DEST_DIR/rig.db" ] && cmp -s "$DB_FILE" "$DEST_DIR/rig.db"; then
+  log "RIG unchanged (byte-for-byte identical to existing) — deterministic skip"
+  echo "{\"changed\":false,\"artifact\":\"raw/arch/$PROJECT/rig.db\",\"status\":\"ok\",\"event\":{\"components\":$COMPONENTS,\"rig_hash\":\"$RIG_HASH\"}}"
+  exit 0
+fi
+
+cp "$RIG_FILE" "$DEST_FILE"
+cp "$DB_FILE" "$DEST_DIR/rig.db"
+
+# Generate model.c4 deterministically FROM THE DB + docs precomputed at emit.
+# This replaces the LLM arch-sync step entirely.
+if [ -f "$EMITTER_DIR/rig-to-c4.py" ]; then
+  log "generating model.c4 (deterministic, from rig.db)…"
+  python3 "$EMITTER_DIR/rig-to-c4.py" "$DEST_DIR/rig.db" -o "$MODEL_FILE" 2>&1 | tail -1 || log "WARN: model.c4 generation failed (non-fatal)"
+else
+  log "rig-to-c4.py not found — skipping model.c4 generation"
+fi
+
+# Generate Mermaid diagrams deterministically from the C4 model.
+# The full artifact set (rig.db + rig.json + model.c4 + *.mmd) is deterministic —
+# the LLM agent never touches these files.
+if [ -f "$MODEL_FILE" ]; then
+  log "generating Mermaid diagrams (deterministic, from model.c4)…"
+  likec4 gen mermaid --use-dot -o "$DEST_DIR" "$DEST_DIR" 2>&1 | tail -1 \
+    || likec4 gen mermaid -o "$DEST_DIR" "$DEST_DIR" 2>&1 | tail -1 \
+    || log "WARN: mermaid generation failed (non-fatal)"
+fi
+
+log "RIG changed — agent will run"
+echo "{\"changed\":true,\"artifact\":\"raw/arch/$PROJECT/rig.db\",\"status\":\"ok\",\"event\":{\"components\":$COMPONENTS,\"rig_hash\":\"$RIG_HASH\"}}"

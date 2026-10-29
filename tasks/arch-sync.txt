@@ -1,0 +1,56 @@
+You are working in a wiki repository (your current directory). The deterministic prepare step has just generated the FULL artifact set under raw/arch/<project>/: 
+  - rig.json   (component graph, evidence-backed)
+  - model.c4   (LikeC4 C4 model, deterministic from RIG)
+  - *.mmd      (Mermaid diagrams, deterministic from model.c4)
+
+These are DETERMINISTIC. Do NOT modify, regenerate, or "fix" them. Your job is to update wiki PROSE based on what changed.
+
+## Step 1: Read the RIG and summarize changes
+
+  cat raw/arch/<project>/rig.json
+
+Identify what changed since last sync:
+  - New components (added executables, libraries)
+  - Removed components
+  - Changed dependencies (new edges, broken edges)
+  - New external packages
+
+## Step 2: Update the llm-wiki entity page (C4 LEVEL ONLY)
+
+Read the existing page FIRST (cat wiki/entities/<project>.md). Preserve ALL manual content (deployment notes, config, operational knowledge).
+
+Update the architecture section:
+  1. Read the .mmd files: cat raw/arch/<project>/*.mmd
+  2. Embed them as ```mermaid blocks (copy the diagram content verbatim)
+  3. Write a SHORT summary of what changed (1-3 sentences)
+  4. Do NOT list every component, file, or dependency — that's in the RIG
+
+C4 BOUNDARY: the llm-wiki carries context/container/component level ONLY. Code-level details (file paths, function signatures, implementation specifics) do NOT belong here.
+
+## Step 3: Offload low-level details to the platform wiki
+
+If the RIG contains details that are too low-level for the llm-wiki (new modules with many source files, implementation notes, API reference), push them to the PROJECT's platform wiki:
+
+  - GitHub repos: gh api --method POST repos/<owner>/<repo>/wiki/pages ...
+    Or clone the wiki: git clone https://github.com/<owner>/<repo>.wiki.git
+  - Forgejo/Codeberg: fj wiki ...
+
+This keeps the llm-wiki unbloated. C4 concepts here; details there.
+
+## Step 4: Bookkeeping
+
+  - Update index.md if pages were added/removed
+  - Append to log.md: operation 'arch-sync', project name, component count
+
+## Step 5: Commit (do NOT push)
+
+  git add -A && git commit -m 'docs(arch-sync): <project>'
+
+A validation gate runs next. If it fails, fix lint errors and commit again.
+
+## Rules
+
+  - Do NOT write model.c4 or run likec4 — deterministic, already done
+  - Do NOT invent architecture from memory — everything comes from the RIG
+  - C4 level only in llm-wiki; push details to platform wiki
+  - Preserve manual content
