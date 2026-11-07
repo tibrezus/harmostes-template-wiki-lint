@@ -30,11 +30,12 @@ jobs:
           sudo mkdir -p /usr/local/kubebuilder/bin && sudo chown -R "$USER" /usr/local/kubebuilder
           curl -sL --retry 5 --retry-all-errors "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.31.0/envtest-v1.31.0-linux-amd64.tar.gz" | tar -xz -C /tmp
           mv /tmp/controller-tools/envtest/* /usr/local/kubebuilder/bin/
-      - name: CR conformance (the shared harness)
+      - name: CR conformance (the kernel-owned harness)
+        # tools/conformance ships IN the kernel (the CRD owner owns its
+        # prober); the checkout above carries it at CONFORMANCE_TAG. Run
+        # inside the kernel tree — it is its own Go module.
         run: |
-          git clone --depth 1 https://github.com/tibrezus/harmostes-config /tmp/config
-          cd /tmp/config && go mod download 2>/dev/null || true
-          go run ./hack/conformance.go -crds "$GITHUB_WORKSPACE/kernel/chart/crds" -objects "$GITHUB_WORKSPACE"
+          ( cd kernel && go run ./tools/conformance -crds "$GITHUB_WORKSPACE/kernel/chart/crds" -objects "$GITHUB_WORKSPACE" )
 
   drift:
     runs-on: ubuntu-latest
